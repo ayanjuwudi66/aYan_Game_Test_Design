@@ -1,0 +1,3 @@
+interface:
+  display_name: "Game Test Design"
+  short_description: "按生命周期、打断与影响面设计游戏测试"
