@@ -4,20 +4,21 @@
 两种格式：
   1) 内部骨架（默认，12 列）：用例ID|模块/功能|状态节点|前置条件|操作步骤|预期结果|
      测试类型|打断层级|影响面|风险级别|优先级|备注。供推演阶段使用。
-  2) 交付版（--format delivery，7 列）：功能|测试点|操作步骤|预期结果|备注|结果|优先级。
+  2) 交付版（--format delivery，8 列）：功能|测试点|前提条件|操作步骤|预期结果|备注|优先级|结果。
      功能列按连续相同值合并；备注/结果留空。这是 SKILL.md「输出约定」规定的用户交付格式，
      可选附带「待确认项清单」「图源说明」两个 sheet。
 
 Usage:
   python gen_testcase_xlsx.py -o cases.xlsx                     # 12 列内部骨架
   python gen_testcase_xlsx.py -i cases.json -o cases.xlsx        # 12 列，读 JSON
-  python gen_testcase_xlsx.py -i delivery.json -o out.xlsx --format delivery   # 7 列交付版
+  python gen_testcase_xlsx.py -i delivery.json -o out.xlsx --format delivery   # 8 列交付版
 
 内部骨架 JSON：对象数组，键为 12 列名（未知键忽略、缺列留空）。
 
 交付版 JSON（两种形态）：
-  A) 纯用例：对象数组，键为 功能/测试点/操作步骤/预期结果/优先级（优先级可省，默认 P2）。
+  A) 纯用例：对象数组，键为 功能/测试点/前提条件/操作步骤/预期结果/优先级（优先级可省，默认 P2）。
      只产「测试用例」sheet；同「功能」连续多条自动合并功能列。
+     「前提条件」可省略——若「操作步骤」以「前置：…」开头，脚本自动拆分为两列（见 split_precondition）。
   B) 三件套：{"cases": [...], "pending": [...], "img_notes": [...]}
      - cases：同上对象数组（必填）
      - pending（可选）：对象数组，键 = 编号/分类/待确认/来源/影响/默认处理/状态
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -41,8 +43,12 @@ COLUMNS = [
     "用例ID", "模块/功能", "状态节点", "前置条件", "操作步骤", "预期结果",
     "测试类型", "打断层级", "影响面", "风险级别", "优先级", "备注",
 ]
-DELIVERY_COLUMNS = ["功能", "测试点", "操作步骤", "预期结果", "备注", "结果", "优先级"]
+DELIVERY_COLUMNS = ["功能", "测试点", "前提条件", "操作步骤", "预期结果", "备注", "优先级", "结果"]
+# 含多条时需要「单元格内换行」的列（见 cell_break）
+BREAK_COLUMNS = {"前置条件", "前提条件", "操作步骤", "预期结果"}
 LEVELS = ["无", "L1", "L2", "L3", "L4", "L5", "L6-a", "L6-b", "L7"]
+# 单元格内换行切分点：序号标记（1. / 2、/ 3) / 4．/ 5））之前；序号后紧跟数字则不算序号
+STEP_SPLIT_RE = re.compile(r'[ \t]*(?<!\d)(?<!第)(?=\d{1,2}[.、．)）](?!\d))')
 IMPACTS = ["自身", "队友", "敌对玩家", "中立单位", "环境场景", "观战/旁观者", "服务器全局", "AI/召唤物"]
 
 
@@ -64,6 +70,8 @@ def build_workbook(rows):
         values = [row.get(col, "") for col in COLUMNS]
         if not values[0]:
             values[0] = f"GT-{idx:03d}"
+        values = [cell_break(v) if col in BREAK_COLUMNS else v
+                  for col, v in zip(COLUMNS, values)]
         ws.append(values)
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
@@ -106,7 +114,7 @@ def build_workbook(rows):
     return wb
 
 
-PENDING_COLUMNS = ["编号", "分类", "待确认规则/疑问点", "来源", "影响行为/用例", "默认处理(供参考)", "状态"]
+PENDING_COLUMNS = ["编号", "分类", "待确认", "来源", "影响", "默认处理", "状态"]
 IMG_NOTE_COLUMNS = ["标题", "内容"]
 
 
@@ -119,7 +127,7 @@ def _style_header(ws, ncols):
 
 
 def build_pending_sheet(wb, pending):
-    """待确认项清单：编号|分类|待确认规则/疑问点|来源|影响行为/用例|默认处理(供参考)|状态"""
+    """待确认项清单：编号|分类|待确认|来源|影响|默认处理|状态"""
     ws = wb.create_sheet("待确认项清单")
     ws.append(PENDING_COLUMNS)
     _style_header(ws, len(PENDING_COLUMNS))
@@ -167,11 +175,63 @@ def build_img_note_sheet(wb, img_notes):
     return ws
 
 
+def split_precondition(steps):
+    """把「前置：…。1. …」拆成 (前提条件, 操作步骤)。
+
+    历史格式把前置条件写进操作步骤首句（`前置：<条件>。1. …`），导致列职责混杂、
+    执行人无法一眼区分"要准备什么"与"要做什么"。2026-09-03 起交付版拆为独立两列。
+
+    规则：以「前置：」开头时，取到第一个「。」为前提条件，其后为操作步骤。
+    不以「前置：」开头（或已显式提供「前提条件」）时原样返回。
+    """
+    if not isinstance(steps, str):
+        return "", steps or ""
+    s = steps.strip()
+    for marker in ("前置：", "前置:"):
+        if s.startswith(marker):
+            body = s[len(marker):]
+            idx = body.find("。")
+            if idx == -1:
+                return body.strip(), ""
+            return body[:idx].strip(), body[idx + 1:].strip()
+    return "", s
+
+
+def cell_break(text):
+    """把单元格内并列的多条内容拆成**单元格内换行**，避免「1. … 2. … 3. …」堆成一长行。
+
+    需求（2026-09-03）：前提条件 / 操作步骤 / 预期结果 等列若含多条，必须在**同一个
+    单元格内**逐条换行显示（1.\\n2.\\n3.），而不是挤在一行靠列宽折行——后者序号会被
+    折断、执行人一眼看不出总共几步。
+
+    规则：
+      - 先按已有换行切分逐行处理，已手写换行的保持原样，不重复插入空行。
+      - 在序号标记（1. / 2、/ 3) / 4．/ 5））前断行；序号后紧跟数字时**不算**序号，
+        以此排除「3.5 秒」「40.50%」这类小数不被误切。
+      - 「第2.」这类序数词不断行。
+      - 只处理**带序号**的并列条目；用「；」分隔但无序号的文案保持原样，不臆测拆分。
+    """
+    if not isinstance(text, str):
+        return text or ""
+    out = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        for part in STEP_SPLIT_RE.sub("\n", line).split("\n"):
+            part = part.strip()
+            if part:
+                out.append(part)
+    return "\n".join(out)
+
+
 def build_delivery_workbook(rows, sheet_name="测试用例"):
-    """7 列交付版，可含「待确认项清单」「图源说明」两个附带 sheet。
+    """8 列交付版，可含「待确认项清单」「图源说明」两个附带 sheet。
+
+    列：功能|测试点|前提条件|操作步骤|预期结果|备注|优先级|结果。
 
     rows 支持两种输入：
-      - list[dict]：纯用例，只产用例 sheet（键：功能/测试点/操作步骤/预期结果/优先级）
+      - list[dict]：纯用例，只产用例 sheet（键：功能/测试点/前提条件/操作步骤/预期结果/优先级）
       - dict：{"cases": [...], "pending": [...], "img_notes": [...]}
               pending 与 img_notes 可选；pending 键 = 编号/分类/待确认/来源/影响/默认处理/状态，
               img_notes 键 = 标题/内容。
@@ -196,7 +256,13 @@ def build_delivery_workbook(rows, sheet_name="测试用例"):
         steps = row.get("操作步骤", "")
         expect = row.get("预期结果", "")
         prio = row.get("优先级", "P2")
-        ws.append([func, point, steps, expect, "", "", prio])
+        # 前提条件独立成列；未显式提供时从操作步骤首句「前置：…」自动拆分
+        pre = row.get("前提条件")
+        if not pre:
+            pre, steps = split_precondition(steps)
+        # 前提条件/操作步骤/预期结果：含多条时在单元格内换行，不堆成一行
+        ws.append([func, point, cell_break(pre), cell_break(steps), cell_break(expect),
+                   "", prio, ""])
 
     # 功能列合并：连续相同「功能」合并单元格
     last_func = None
@@ -223,10 +289,11 @@ def build_delivery_workbook(rows, sheet_name="测试用例"):
             cell.border = border
             cell.alignment = Alignment(wrap_text=True, vertical="top")
     for r in range(2, ws.max_row + 1):
-        ws.cell(row=r, column=7).alignment = Alignment(horizontal="center", vertical="center")
+        for c in (7, 8):
+            ws.cell(row=r, column=c).alignment = Alignment(horizontal="center", vertical="center")
 
     ws.freeze_panes = "A2"
-    for i, width in enumerate([24, 30, 56, 52, 20, 8, 8], 1):
+    for i, width in enumerate([24, 30, 40, 48, 52, 20, 8, 8], 1):
         ws.column_dimensions[get_column_letter(i)].width = width
 
     # 附带 sheet
@@ -238,11 +305,11 @@ def build_delivery_workbook(rows, sheet_name="测试用例"):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="生成游戏测试用例 Excel（12 列骨架 / 7 列交付版）")
+    parser = argparse.ArgumentParser(description="生成游戏测试用例 Excel（12 列骨架 / 8 列交付版）")
     parser.add_argument("-i", "--input", type=Path, help="用例 JSON 文件（对象数组或对象）")
     parser.add_argument("-o", "--output", type=Path, required=True, help="输出 .xlsx 路径")
     parser.add_argument("--format", choices=["skeleton", "delivery"], default="skeleton",
-                        help="skeleton=12 列内部骨架（默认）；delivery=7 列交付版（可含待确认项/图源说明）")
+                        help="skeleton=12 列内部骨架（默认）；delivery=8 列交付版（可含待确认项/图源说明）")
     parser.add_argument("--sheet-name", type=str, default="测试用例",
                         help="delivery 模式用例工作表名（默认「测试用例」，可按被测功能命名）")
     args = parser.parse_args()
